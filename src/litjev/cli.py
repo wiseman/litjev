@@ -27,6 +27,8 @@ def serve():
     parser.add_argument("--lambda", dest="lambda_", type=float, default=0.0)
     parser.add_argument("--think-budget", type=int, default=0, help="0 disables default routing")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--backend", choices=["transformers", "vllm"], default="transformers")
+    parser.add_argument("--vllm-url", default="http://127.0.0.1:8020", help="vLLM OpenAI server")
     args = parser.parse_args()
 
     def factory():
@@ -44,7 +46,14 @@ def serve():
         settings = ModelSettings(
             args.model, args.revision, args.device_map, args.dtype, feature_layers=layers
         )
-        scorer = TransformersScorer.load(settings)
+        if args.backend == "vllm":
+            if head is not None:
+                raise ValueError("Decision heads need hidden states; use --backend transformers")
+            from litjev.vllm_backend import VLLMScorer
+
+            scorer = VLLMScorer.load(args.vllm_url, args.model, args.revision)
+        else:
+            scorer = TransformersScorer.load(settings)
         if head is not None:
             if head.metadata.hidden_size != scorer.hidden_size:
                 raise ValueError("Decision head hidden size does not match the model")
