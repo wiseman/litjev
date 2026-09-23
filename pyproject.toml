@@ -27,6 +27,11 @@ dependencies = [
 
 [project.optional-dependencies]
 games = ["gymnasium>=1.1.1", "chess>=1.11.2", "vizdoom>=1.2.4"]
+# Optional Triton kernels for the Qwen 3.x gated-delta-net (linear attention) layers on the
+# transformers backend; without them transformers uses its slower torch reference path.
+# Triton compiles a small C launcher on first use, so the Python interpreter needs its
+# development headers (a uv-managed Python has them; some system builds do not).
+fast = ["flash-linear-attention>=0.5.2"]
 dev = [
   "httpx>=0.28.0",
   "pytest>=8.4.0",
