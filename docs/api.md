@@ -46,13 +46,26 @@ response reports the actual checkpoint, never pretends to be `jev-latest`.
 
 | Type | Criteria | Answer fields |
 | --- | --- | --- |
-| `choice` | Map of up to 255 option keys to descriptions | `type`, `choice`, `probabilities`, `confidence` |
+| `choice` | Map of up to 255 option keys to descriptions (see [Option cap](#option-cap)) | `type`, `choice`, `probabilities`, `confidence` |
 | `score` | Ordered array of 2–10 level descriptions | `type`, `score`, `legend`, `probabilities`, `confidence` |
 | `noul` | Optional map with `true` and/or `false` descriptions | `type`, `noul` |
 
 Choice returns the original option key, even when it contains multiple tokens.
 Score returns the probability-weighted level index (0-based), not the winning level.
 Noul returns P(yes), not a boolean. Score `legend` preserves original descriptions.
+
+### Option cap
+
+The 255-option limit on `choice` is a server default, not a model limit: every
+option gets an internal single-token letter code at the answer boundary, and the
+Qwen 3.x tokenizers supply well over 1,000 of them. Start the server with
+`--max-choices N` to accept larger option lists (e.g. `litjev --max-choices 400`).
+The server checks at startup that the tokenizer can supply `N` codes; a request
+over the cap is rejected with a validation error naming the limit. Prompt length
+still grows with the option list, so very large lists also need the input to fit
+the model's context budget. When serving through a vLLM backend, the vLLM server's
+`--max-logprobs` must be at least the cap, because all option codes of a decision
+are requested as logprobs.
 
 ## Response
 

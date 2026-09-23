@@ -3,11 +3,29 @@
 from collections.abc import Iterator, Mapping
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator
 
+# Default upper bound on Choice options. It is a server policy, not a tokenizer limit (the Qwen
+# 3.x tokenizers supply well over 1,000 single-token answer codes); `litjev --max-choices`
+# raises it for deployments that need larger option lists.
 MAX_CHOICES = 255
+_max_choices = MAX_CHOICES
 Content = str | dict[str, JsonValue] | list[JsonValue] | None
 State = str | dict[str, JsonValue] | list[JsonValue]
+
+
+def max_choices():
+    """Current Choice option cap enforced by request validation."""
+    return _max_choices
+
+
+def set_max_choices(limit):
+    """Set the Choice option cap for this process; returns the previous cap."""
+    global _max_choices
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("max_choices must be a positive integer")
+    previous, _max_choices = _max_choices, limit
+    return previous
 
 
 class QuestionBase(BaseModel):
@@ -17,7 +35,17 @@ class QuestionBase(BaseModel):
 
 class Choice(QuestionBase):
     type: Literal["choice"] = "choice"
-    criteria: dict[str, Content] = Field(min_length=1, max_length=MAX_CHOICES)
+    criteria: dict[str, Content] = Field(min_length=1)
+
+    @field_validator("criteria")
+    @classmethod
+    def _within_option_cap(cls, value):
+        if len(value) > _max_choices:
+            raise ValueError(
+                f"Choice allows at most {_max_choices} options, got {len(value)}"
+                " (the server's --max-choices)"
+            )
+        return value
 
     @property
     def choices(self):
