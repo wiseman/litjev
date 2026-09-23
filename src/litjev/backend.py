@@ -4,6 +4,7 @@ The optional slow path re-runs escalated branches with the backbone's own thinki
 mode and reads the same answer boundary again. The backbone is never modified.
 """
 
+import copy
 import threading
 from dataclasses import dataclass
 
@@ -165,55 +166,88 @@ class TransformersScorer:
         prefix_ids = torch.tensor([prefix], device=device)
         return compiled, {"input_ids": prefix_ids, "attention_mask": torch.ones_like(prefix_ids)}
 
+    @staticmethod
+    def _length_groups(lengths, ratio=2.0):
+        """Group branch indices so no branch is padded beyond `ratio`x its own length."""
+        order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+        groups, current = [], []
+        for i in order:
+            if current and lengths[i] > ratio * lengths[current[0]]:
+                groups.append(current)
+                current = []
+            current.append(i)
+        if current:
+            groups.append(current)
+        return groups
+
     def _score(self, state, schema):
         compiled, inputs = self._prepare(state, schema)
         device = inputs["input_ids"].device
         prefix_length = compiled.prefix_length
         base = self.model(**inputs, use_cache=True, logits_to_keep=1)
         cache = base.past_key_values
-        reorder = getattr(cache, "reorder_cache", None)
-        if reorder is None:
+        if getattr(cache, "reorder_cache", None) is None:
             raise RuntimeError("Model cache does not support branch replication")
-        # Supports Qwen hybrid attention: both KV and convolution/recurrent states.
-        reorder(torch.zeros(len(schema), dtype=torch.long, device=device))
         suffixes = compiled.slot_ids
-        width = max(map(len, suffixes))
         pad = self._pad_id()
-        ids = torch.tensor([row + [pad] * (width - len(row)) for row in suffixes], device=device)
-        lengths = torch.tensor(list(map(len, suffixes)), device=device)
-        suffix_mask = torch.arange(width, device=device)[None, :] < lengths[:, None]
-        mask = torch.cat(
-            [
-                torch.ones((len(schema), prefix_length), device=device, dtype=torch.long),
-                suffix_mask.long(),
-            ],
-            dim=1,
-        )
-        positions = torch.arange(prefix_length, prefix_length + width, device=device)
-        positions = positions[None, :].expand(len(schema), -1)
+        delta = None
         if isinstance(state, VisualState):
             # Image patches consume sequence slots but have 3-D rotary coordinates.
             # Continue after the image prefix's M-RoPE extent, not its token count.
             delta = self.model.model.rope_deltas
             if delta is None or delta.shape[0] != 1:
                 raise RuntimeError("Missing single-image-prefix M-RoPE state")
-            positions = (positions + delta.to(device))[None, :, :].expand(3, -1, -1)
-        output = self.model(
-            input_ids=ids,
-            attention_mask=mask,
-            position_ids=positions,
-            past_key_values=cache,
-            use_cache=True,
-            output_hidden_states=bool(self.feature_layers),
-        )
+            delta = delta.to(device)
+        # Branches padded to one common width re-process the longest suffix once per
+        # question, so a short noul/score question pays for a long option list. Group
+        # branches by length; every group replays the same state prefix cache.
+        groups = self._length_groups([len(row) for row in suffixes])
+        logits = [None] * len(suffixes)
+        hidden = [None] * len(suffixes)
+        rope = [None] * len(suffixes)
+        for g, group in enumerate(groups):
+            # Supports Qwen hybrid attention: both KV and convolution/recurrent states.
+            group_cache = copy.deepcopy(cache) if g < len(groups) - 1 else cache
+            group_cache.reorder_cache(torch.zeros(len(group), dtype=torch.long, device=device))
+            rows = [suffixes[i] for i in group]
+            width = max(map(len, rows))
+            ids = torch.tensor([row + [pad] * (width - len(row)) for row in rows], device=device)
+            lengths = torch.tensor(list(map(len, rows)), device=device)
+            suffix_mask = torch.arange(width, device=device)[None, :] < lengths[:, None]
+            mask = torch.cat(
+                [
+                    torch.ones((len(group), prefix_length), device=device, dtype=torch.long),
+                    suffix_mask.long(),
+                ],
+                dim=1,
+            )
+            positions = torch.arange(prefix_length, prefix_length + width, device=device)
+            positions = positions[None, :].expand(len(group), -1)
+            if delta is not None:
+                positions = (positions + delta)[None, :, :].expand(3, -1, -1)
+            # Only the readout positions need vocabulary logits.
+            keep = sorted({len(suffixes[i]) - 1 for i in group})
+            output = self.model(
+                input_ids=ids,
+                attention_mask=mask,
+                position_ids=positions,
+                past_key_values=group_cache,
+                use_cache=True,
+                output_hidden_states=bool(self.feature_layers),
+                logits_to_keep=torch.tensor(keep, device=device),
+            )
+            for r, i in enumerate(group):
+                last = len(suffixes[i]) - 1
+                logits[i] = (
+                    output.logits[r, keep.index(last), compiled.candidates[i]].float().cpu().numpy()
+                )
+                hidden[i] = self._readout_hidden(output, r, last)
+                rope[i] = positions[:, r, last].tolist() if positions.ndim == 3 else None
         config = getattr(self.model.config, "text_config", self.model.config)
         return tuple(
             RawFieldScores(
                 name,
-                output.logits[i, len(suffixes[i]) - 1, compiled.candidates[i]]
-                .float()
-                .cpu()
-                .numpy(),
+                logits[i],
                 prefix_length + sum(map(len, suffixes)),
                 {
                     "method": "two_forward_cached_branches",
@@ -223,6 +257,7 @@ class TransformersScorer:
                     "last_decoder_layer_index": config.num_hidden_layers - 1,
                     "decoder_layer_count": config.num_hidden_layers,
                     "batch_index": i,
+                    "branch_groups": len(groups),
                     "selected_logit_index": len(suffixes[i]) - 1,
                     "prefix_token_count": compiled.prefix_length,
                     "slot_text": compiled.slot_texts[i],
@@ -236,11 +271,9 @@ class TransformersScorer:
                     "image_grid_thw": inputs["image_grid_thw"].tolist()
                     if "image_grid_thw" in inputs
                     else None,
-                    "readout_rope_positions": positions[:, i, len(suffixes[i]) - 1].tolist()
-                    if positions.ndim == 3
-                    else None,
+                    "readout_rope_positions": rope[i],
                 },
-                hidden=self._readout_hidden(output, i, len(suffixes[i]) - 1),
+                hidden=hidden[i],
             )
             for i, name in enumerate(schema.names)
         )
