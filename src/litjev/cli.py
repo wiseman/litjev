@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from litjev.calibration import CalibrationProfile, TemperatureCalibrator
-from litjev.slots import SLOT_FORMAT
+from litjev.schema import MAX_CHOICES, set_max_choices
+from litjev.slots import SLOT_FORMAT, candidate_codes
 
 
 def serve():
@@ -29,7 +30,16 @@ def serve():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--backend", choices=["transformers", "vllm"], default="transformers")
     parser.add_argument("--vllm-url", default="http://127.0.0.1:8020", help="vLLM OpenAI server")
+    parser.add_argument(
+        "--max-choices",
+        type=int,
+        default=MAX_CHOICES,
+        help=f"Largest Choice option list accepted per question (default {MAX_CHOICES})",
+    )
     args = parser.parse_args()
+    if args.max_choices < 1:
+        parser.error("--max-choices must be positive")
+    set_max_choices(args.max_choices)
 
     def factory():
         from litjev.heads import DecisionHead
@@ -54,6 +64,9 @@ def serve():
             scorer = VLLMScorer.load(args.vllm_url, args.model, args.revision)
         else:
             scorer = TransformersScorer.load(settings)
+        # Fail at startup, not on the first large request, if the tokenizer cannot supply
+        # enough single-token answer codes for the configured cap.
+        candidate_codes(scorer.tokenizer, args.max_choices)
         if head is not None:
             if head.metadata.hidden_size != scorer.hidden_size:
                 raise ValueError("Decision head hidden size does not match the model")
