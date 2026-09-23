@@ -80,11 +80,32 @@ class TransformersScorer:
         loader = (
             AutoModelForImageTextToText if config.model_type == "qwen3_5" else AutoModelForCausalLM
         )
+        extra = {}
+        qc = getattr(config, "quantization_config", None)
+        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
+            # Workaround for Qwen 3.x dense FP8 checkpoints (e.g. Qwen3.8-27B-FP8): their
+            # `modules_to_not_convert` lists MoE-style router names (`...mlp.gate`) and MTP-head
+            # modules that do not exist in the dense model. transformers matches skip patterns with
+            # an unanchored regex, so `...mlp.gate` also excludes `...mlp.gate_proj`; its FP8 scales
+            # are then dropped and the layer computes on raw e4m3 bytes -> near-random logits.
+            from transformers import FineGrainedFP8Config
+
+            skip = [
+                m
+                for m in qc.get("modules_to_not_convert", [])
+                if not (m.endswith((".mlp.gate", ".shared_expert_gate")) or m.startswith("mtp."))
+            ]
+            extra["quantization_config"] = FineGrainedFP8Config(
+                modules_to_not_convert=skip,
+                weight_block_size=tuple(qc.get("weight_block_size", (128, 128))),
+                activation_scheme=qc.get("activation_scheme", "dynamic"),
+            )
         model = loader.from_pretrained(
             settings.model_id,
             revision=settings.revision,
             dtype=getattr(torch, settings.dtype),
             device_map=settings.device_map,
+            **extra,
         )
         tokenizer = AutoTokenizer.from_pretrained(settings.model_id, revision=settings.revision)
         processor = (
